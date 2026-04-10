@@ -15,11 +15,12 @@ import (
 type FindResult struct {
 	Word  string
 	Index int
+	Sep   rune // 0 = complete match; 1–7 = partial match separator
 }
 
 type edgeStart struct {
-	node int
-	ch   rune
+	node    int
+	label   string
 }
 
 func (edge edgeStart) String() string {
@@ -33,8 +34,18 @@ type edgeEnd struct {
 
 type uncheckedNode struct {
 	parent int
-	ch     rune
+	label     string
 	child  int
+}
+
+// sepMin and sepMax define the inclusive range of separator bytes.
+// ASCII control codes 0x01–0x07: SOH, STX, ETX, EOT, ENQ, ACK, BEL.
+const sepMin rune = 0x01
+const sepMax rune = 0x07
+
+// isSep reports whether r is one of the seven separator bytes.
+func isSep(r rune) bool { 
+		return r >= sepMin && r <= sepMax 
 }
 
 // EnumFn is a method that you implement. It will be called with
@@ -60,14 +71,13 @@ const (
 // Finder is the interface for querying a dawg. Use either
 // Builder.Finish() or Load() to obtain one.
 type Finder interface {
-	// Find all prefixes of the given string
-	FindAllPrefixesOf(input string) []FindResult
-
 	// Find the index of the given string
 	IndexOf(input string) int
 
 	AtIndex(index int) (string, error)
 
+	FindLongestPrefix(input string) FindResult
+	
 	// Enumerate all prefixes stored in the dawg.
 	Enumerate(fn EnumFn)
 
@@ -274,52 +284,6 @@ func (d *dawg) Print() {
 	DumpFile(d.r)
 }
 
-// FindAllPrefixesOf returns all items in the dawg that are a prefix of the input string.
-// It will panic if the dawg is not finished.
-func (d *dawg) FindAllPrefixesOf(input string) []FindResult {
-
-	d.checkFinished()
-
-	var results []FindResult
-	skipped := 0
-	final := d.hasEmptyWord
-	node := rootNode
-	var edgeEnd edgeEnd
-	var ok bool
-
-	r := newBitSeeker(d.r)
-
-	// for each character of the input
-	for pos, letter := range input {
-		// if the node is final, add a result
-		if final {
-			results = append(results, FindResult{
-				Word:  input[:pos],
-				Index: skipped,
-			})
-		}
-
-		// check if there is an outgoing edge for the letter
-		edgeEnd, final, ok = d.getEdge(&r, edgeStart{node: node, ch: letter})
-		if !ok {
-			return results
-		}
-
-		// we found an edge.
-		node = edgeEnd.node
-		skipped += edgeEnd.count
-	}
-
-	if final {
-		results = append(results, FindResult{
-			Word:  input,
-			Index: skipped,
-		})
-	}
-
-	return results
-}
-
 // IndexOf returns the index, which is the order the item was inserted.
 // If the item was never inserted, it returns -1
 // It will panic if the dawg is not finished.
@@ -397,24 +361,40 @@ func (d *dawg) newNode() int {
 	return d.nextID - 1
 }
 
+
 func (d *dawg) nameOf(nodeid int) string {
-	node := d.nodes[nodeid]
-
-	// node name is id_ch:id... for each child
-	buff := bytes.Buffer{}
-	for _, edge := range node.edges {
-		buff.WriteByte('_')
-		buff.WriteRune(edge.ch)
-		buff.WriteByte(':')
-		buff.WriteString(strconv.Itoa(edge.node))
-	}
-
-	if node.final {
-		buff.WriteByte('!')
-	}
-
-	return buff.String()
+    var buff bytes.Buffer
+    for _, edge := range d.nodes[nodeid].edges {
+        buff.WriteByte('_')
+        buff.WriteString(edge.label)
+        buff.WriteByte(':')
+        buff.WriteString(strconv.Itoa(edge.node))
+    }
+    if d.nodes[nodeid].final {
+        buff.WriteByte('!')
+    }
+    return buff.String()
 }
+
+
+// func (d *dawg) nameOf(nodeid int) string {
+//	node := d.nodes[nodeid]
+//
+//	// node name is id_ch:id... for each child
+//	buff := bytes.Buffer{}
+//	for _, edge := range node.edges {
+//		buff.WriteByte('_')
+//		buff.WriteRune(edge.ch)
+//		buff.WriteByte(':')
+//		buff.WriteString(strconv.Itoa(edge.node))
+//	}
+//
+//	if node.final {
+//		buff.WriteByte('!')
+//	}
+//
+//	return buff.String()
+// }
 
 func (d *dawg) setFinal(node int) {
 	d.nodes[node].final = true
@@ -423,43 +403,69 @@ func (d *dawg) setFinal(node int) {
 	}
 }
 
-func (d *dawg) addChild(parent int, ch rune, child int) {
-	//log.Printf("Addchild %v(%v)->%v", parent, string(ch), child)
-	d.numEdges++
-	if d.nodes[child] == nil {
-		d.nodes[child] = &node{
-			count: -1,
-		}
-	}
-	node := d.nodes[parent]
-	if len(node.edges) > 0 && ch <= node.edges[len(node.edges)-1].ch {
-		log.Panic("Not strictly increasing")
-	}
-	node.edges = append(node.edges, edgeStart{child, ch})
+func (d *dawg) addChild(parent int, label string, child int) {
+    d.numEdges++
+    if d.nodes[child] == nil {
+        d.nodes[child] = &node{count: -1}
+    }
+    n := d.nodes[parent]
+    if len(n.edges) > 0 && label <= n.edges[len(n.edges)-1].label {
+        log.Panic("addChild: labels not in strictly increasing order")
+    }
+    n.edges = append(n.edges, edgeStart{child, label})
 }
 
-func (d *dawg) replaceChild(parent int, ch rune, child int) {
-	pnode := d.nodes[parent]
-	//TODO: should be bsearch
-	i := bsearch(len(pnode.edges), func(i int) int {
-		return int(pnode.edges[i].ch - ch)
-	})
 
-	if pnode.edges[i].ch != ch {
-		//for _, edge := range pnode.edges {
-		//	log.Printf("Edge %c %d", rune(edge.ch), edge.node)
-		//}
-		log.Panicf("Not found: %c", ch)
-	}
+// func (d *dawg) addChild(parent int, ch rune, child int) {
+//	//log.Printf("Addchild %v(%v)->%v", parent, string(ch), child)
+//	d.numEdges++
+//	if d.nodes[child] == nil {
+//		d.nodes[child] = &node{
+//			count: -1,
+//		}
+//	}
+//	node := d.nodes[parent]
+//	if len(node.edges) > 0 && ch <= node.edges[len(node.edges)-1].ch {
+//		log.Panic("Not strictly increasing")
+//	}
+//	node.edges = append(node.edges, edgeStart{child, ch})
+// }
 
-	//log.Printf("ReplaceChild(%v:%v=>%v, %v:%v=>%v)",
-	//	parent, string(ch), pnode.edges[i].node,
-	//	parent, string(ch), child)
-
-	delete(d.nodes, pnode.edges[i].node)
-	pnode.edges[i].node = child
-
+func (d *dawg) replaceChild(parent int, label string, child int) {
+    pnode := d.nodes[parent]
+    i := sort.Search(len(pnode.edges), func(i int) bool {
+        return pnode.edges[i].label >= label
+    })
+    if i == len(pnode.edges) || pnode.edges[i].label != label {
+        log.Panicf("replaceChild: label %q not found", label)
+    }
+    delete(d.nodes, pnode.edges[i].node)
+    pnode.edges[i].node = child
 }
+
+
+// func (d *dawg) replaceChild(parent int, ch rune, child int) {
+//	pnode := d.nodes[parent]
+//	//TODO: should be bsearch
+//	i := bsearch(len(pnode.edges), func(i int) int {
+//		return int(pnode.edges[i].ch - ch)
+//	})
+//
+//	if pnode.edges[i].ch != ch {
+//		//for _, edge := range pnode.edges {
+//		//	log.Printf("Edge %c %d", rune(edge.ch), edge.node)
+//		//}
+//		log.Panicf("Not found: %c", ch)
+//	}
+//
+//	//log.Printf("ReplaceChild(%v:%v=>%v, %v:%v=>%v)",
+//	//	parent, string(ch), pnode.edges[i].node,
+//	//	parent, string(ch), child)
+//
+//	delete(d.nodes, pnode.edges[i].node)
+//	pnode.edges[i].node = child
+//
+// }
 
 func (d *dawg) calculateSkipped(nodeid int) int {
 	// for each child of the node, calculate now many nodes
@@ -566,4 +572,55 @@ func (d *dawg) atIndex(r *bitSeeker, nodeNumber, atIndex, targetIndex int, runes
 	}
 	return "", false
 
+}
+
+
+// FindLongestPrefix walks the token-centric DAWG as far as it can go,
+// returning the longest prefix of input that ends on a complete registered
+// token boundary.  If the walk dies on an unregistered token, Sep carries
+// the separator byte that introduced that token.  If no final node was ever
+// reached, Index is -1.
+func (d *dawg) FindLongestPrefix(input string) FindResult {
+    d.checkFinished()
+
+    parts := tokenise(input) // []tokenSep from Change 3
+    result := FindResult{Index: -1}
+
+    skipped := 0
+    node := rootNode
+    r := newBitSeeker(d.r)
+    completed := make([]string, 0, len(parts))
+
+    for _, part := range parts {
+        edgeEnd, nextFinal, ok := d.getEdgeByLabel(&r, node, part.token)
+        if !ok {
+            // Dead end or partial token.  The best we found so far is in result.
+            // Record the separator that introduced the failing segment.
+            if result.Index >= 0 {
+                result.Sep = part.sep
+            }
+            return result
+        }
+
+        completed = append(completed, part.token)
+        node = edgeEnd.node
+        skipped += edgeEnd.count
+
+        if nextFinal {
+            // Landed on a registered entry — update the best match.
+            result.Word  = joinTokens(completed)
+            result.Index = skipped
+            result.Sep   = 0 // complete match so far; may be overwritten later
+        }
+        // If not final we keep walking — a longer registered prefix may exist further on.
+    }
+
+    // Exhausted all tokens without a dead end.
+    // If the last node was not final, the Sep from the last segment is relevant.
+    if result.Index >= 0 && result.Sep == 0 {
+        last := parts[len(parts)-1]
+        _ = last // Sep is already 0 — query ended exactly on a boundary we matched
+    }
+
+    return result
 }
