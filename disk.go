@@ -12,40 +12,52 @@ import (
 )
 
 /* FILE FORMAT
+
 - 4 bytes - total size of file
-- 1 byte: cbits
+- 1 byte: cbits  (always 6 in this implementation)
 - 1 byte: abits
 - 7code - number of words
 - 7code - number of nodes
 - 7code - number of edges
 - let wbits be the number of bits to represent the total number of words in the file.
 - for each node:
-	- 1 bit: is node final?
-	- 1 bit: fallthrough?
+  - 1 bit: is node final?
+  - 1 bit: fallthrough?
+  - if fallthrough
+      cbits: character (6-bit encoded index)
+    else:
+      1 bit: single edge?
+      - if !single edge:
+          7code: number of edges
+          log(wbits): nskip (number of bits in skip field)
+      - for each edge:
+          cbits: character (6-bit encoded index)
+          if this is not the first edge:
+              nskip: count
+          abits: location in bits of the node to jump to from start of file.
 
-	- if fallthrough
-		cbits: character
-	else:
-		1 bit: single edge?
-		- if !single edge:
-			7code: number of edges
-			log(wbits): nskip (number of bits in skip field)
-		- for each edge:
-			cbits: character
-			if this is not the first edge:
-				nskip: count
-			abits: location in bits of the node to jump to from start of file.
+6-BIT CHARACTER ENCODING
+The alphabet of 64 supported characters is:
+  Index  0-25: 'a'-'z'
+  Index 26-51: 'A'-'Z'
+  Index 52-61: '0'-'9'
+  Index 62:    '+'
+  Index 63:    '-'
+
+All input words must consist solely of characters from this alphabet.
 
 We define 7code to be an unsigned that can be read the following way:
 
 result = 0
 for {
-	data = next 8 bits
-	result = result << 7 | data & 0x7f
-	if data & 0x80 == 0 break
+    data = next 8 bits
+    result = result << 7 | data & 0x7f
+    if data & 0x80 == 0 break
 }
-
 */
+
+// cbitsFixed is the fixed character-field width in bits.
+const cbitsFixed = 6
 
 // Save writes the dawg to disk. Returns the number of bytes written
 func (d *dawg) Save(filename string) (int64, error) {
@@ -55,8 +67,8 @@ func (d *dawg) Save(filename string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	defer f.Close()
+
 	return d.Write(f)
 }
 
@@ -76,7 +88,8 @@ func (n *node) isFallthrough(id int) bool {
 	return len(n.edges) == 1 && n.edges[0].node == id+1
 }
 
-// Save writes the dawg to an io.Writer. Returns the number of bytes written
+// Write writes the dawg to an io.Writer using a fixed 6-bit character encoding.
+// Returns the number of bytes written.
 func (d *dawg) Write(wIn io.Writer) (int64, error) {
 	if d.r != nil {
 		return io.Copy(wIn, io.NewSectionReader(d.r, 0, d.size))
@@ -88,24 +101,18 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 
 	w := newBitWriter(wIn)
 
-	// get maximum character and calculate cbits
-	// record node addresses, calculate counts and number of edges
-	addresses := make([]uint64, d.NumNodes(), d.NumNodes())
-	var maxChar rune
-	for _, node := range d.nodes {
-		for _, edge := range node.edges {
-			if edge.ch > maxChar {
-				maxChar = edge.ch
-			}
-		}
-	}
+	// Fixed 6-bit character width.
+	cbits := uint64(cbitsFixed)
 
-	cbits := uint64(bits.Len(uint(maxChar)))
+	// record node addresses, calculate counts
+	addresses := make([]uint64, d.NumNodes(), d.NumNodes())
+
 	wbits := uint64(bits.Len(uint(d.NumAdded())))
 	nskiplen := uint64(bits.Len(uint(wbits)))
 
-	// let abits = 1
+	// let abits = 1, iterate until stable
 	abits := uint64(1)
+
 	var pos uint64
 	for {
 		// position = 32 + 8 + 8 + encoded length of number of words, nodes, and edges
@@ -136,16 +143,13 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 				numEdges := uint64(len(node.edges))
 
 				// find maximum value of skip
-
 				skip := 0
 				if node.final {
 					skip = 1
 				}
-
 				for _, edge := range node.edges {
 					skip += d.nodes[edge.node].count
 				}
-
 				nskipbits := uint64(bits.Len(uint(skip)))
 
 				if numEdges != 1 {
@@ -153,7 +157,7 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 					pos += nskiplen
 				}
 
-				// add #edges * (cbits + wbits + abits)
+				// add #edges * (cbits + nskipbits + abits) - nskipbits (first edge has no skip field)
 				if numEdges > 0 {
 					pos += numEdges*(cbits+nskipbits+abits) - nskipbits
 				}
@@ -169,7 +173,7 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 
 	size := (pos + 7) / 8
 
-	// write file size, cbits, abits
+	// write file size, cbits (always 6), abits
 	w.WriteBits(size, 32)
 	w.WriteBits(cbits, 8)
 	w.WriteBits(abits, 8)
@@ -179,9 +183,10 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 	writeUnsigned(w, uint64(d.NumNodes()))
 	writeUnsigned(w, uint64(d.NumEdges()))
 
-	// for each edge,
+	// for each node
 	for i := range addresses {
 		node := d.nodes[i]
+
 		count := 0
 		if node.final {
 			count++
@@ -192,18 +197,18 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 
 		if node.isFallthrough(i) {
 			w.WriteBits(1, 1)
+			// encode character as 6-bit index
 			w.WriteBits(uint64(node.edges[0].ch), int(cbits))
 		} else {
 			w.WriteBits(0, 1)
+
 			skip := 0
 			if node.final {
 				skip = 1
 			}
-
 			for _, edge := range node.edges {
 				skip += d.nodes[edge.node].count
 			}
-
 			nskipbits := uint64(bits.Len(uint(skip)))
 
 			if len(node.edges) == 1 {
@@ -215,7 +220,7 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 			}
 
 			for index, edge := range node.edges {
-				// write character, address
+				// write character as 6-bit encoded index, then optional skip, then address
 				w.WriteBits(uint64(edge.ch), int(cbits))
 				if index > 0 {
 					w.WriteBits(uint64(count), int(nskipbits))
@@ -227,7 +232,6 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 	}
 
 	w.Flush()
-
 	return int64(size), nil
 }
 
@@ -237,7 +241,6 @@ func Load(filename string) (Finder, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return Read(f, 0)
 }
 
@@ -252,16 +255,21 @@ func Read(f io.ReaderAt, offset int64) (Finder, error) {
 	}
 
 	r := newBitSeeker(f)
-
 	r.Seek(32, 0)
+
 	cbits := r.ReadBits(8)
 	abits := r.ReadBits(8)
+
 	numAdded := int(readUnsigned(&r))
 	numNodes := int(readUnsigned(&r))
 	numEdges := int(readUnsigned(&r))
+
 	firstNodeOffset := r.Tell()
+
 	hasEmpty := r.ReadBits(1) == 1
+
 	wbits := int64(bits.Len(uint(numAdded)))
+
 	dawg := &dawg{
 		finished:        true,
 		numAdded:        numAdded,
@@ -290,6 +298,7 @@ func (d *dawg) Close() error {
 func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 	var edgeEnd edgeEnd
 	var final, ok bool
+
 	if d.numEdges > 0 {
 		pos := int64(eStart.node)
 		if pos == 0 {
@@ -298,12 +307,13 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 		}
 
 		r.Seek(pos, 0)
+
 		nodeFinal := int(r.ReadBits(1))
 		fallthr := int(r.ReadBits(1))
 
 		if fallthr == 1 {
-			ch := rune(r.ReadBits(d.cbits))
-			if ch == eStart.ch {
+			ch := r.ReadBits(d.cbits)
+			if ch == uint64(eStart.ch) {
 				edgeEnd.count = nodeFinal
 				edgeEnd.node = int(r.Tell())
 				final = r.ReadBits(1) == 1
@@ -314,21 +324,26 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 			numEdges := uint64(1)
 			nskiplen := int64(bits.Len(uint(d.wbits)))
 			nskip := int64(0)
+
 			if singleEdge != 1 {
 				numEdges = readUnsigned(r)
 				nskip = int64(r.ReadBits(nskiplen))
 			}
 
 			pos = r.Tell()
+
+			// Binary search over edges: each edge is cbits + nskip + abits wide
+			// (except the first edge which has no nskip field).
 			bsearch(int(numEdges), func(i int) int {
 				seekTo := pos + int64(i)*int64(d.cbits+nskip+d.abits)
 				if i > 0 {
 					seekTo -= nskip
 				}
-
 				r.Seek(seekTo, 0)
-				ch := rune(r.ReadBits(d.cbits))
-				if ch == eStart.ch {
+
+				ch := r.ReadBits(d.cbits)
+
+				if ch == uint64(eStart.ch) {
 					if i > 0 {
 						edgeEnd.count = int(r.ReadBits(nskip))
 					} else {
@@ -339,7 +354,8 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 					final = r.ReadBits(1) == 1
 					ok = true
 				}
-				return int(ch - eStart.ch)
+
+				return int(ch) - int(eStart.ch)
 			})
 		}
 	}
@@ -354,13 +370,14 @@ type nodeResult struct {
 }
 
 type edgeResult struct {
-	ch    rune
+	ch    uint8
 	count int
 	node  int
 }
 
 func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 	var result nodeResult
+
 	pos := int64(node)
 	if pos == 0 {
 		// its the first node
@@ -368,6 +385,7 @@ func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 	}
 
 	r.Seek(pos, 0)
+
 	nodeFinal := r.ReadBits(1)
 	fallthr := r.ReadBits(1)
 
@@ -376,7 +394,7 @@ func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 
 	if fallthr == 1 {
 		result.edges = append(result.edges, edgeResult{
-			ch:    rune(r.ReadBits(d.cbits)),
+			ch:    byte(r.ReadBits(d.cbits)),
 			count: int(nodeFinal),
 			node:  int(r.Tell()),
 		})
@@ -386,6 +404,7 @@ func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 
 		singleEdge := r.ReadBits(1)
 		numEdges := uint64(1)
+
 		if singleEdge != 1 {
 			numEdges = readUnsigned(r)
 			nskip = int64(r.ReadBits(nskiplen))
@@ -401,18 +420,20 @@ func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 			}
 			address := r.ReadBits(int64(d.abits))
 			result.edges = append(result.edges, edgeResult{
-				ch:    rune(ch),
+				ch:    byte(ch),
 				count: int(count),
 				node:  int(address),
 			})
 		}
 	}
+
 	return result
 }
 
 // DumpFile prints out the file
 func DumpFile(f io.ReaderAt) {
 	r := newBitSeeker(f)
+
 	size := r.ReadBits(32)
 	fmt.Printf("[%08x] Size=%v bytes\n", r.Tell()-32, size)
 
@@ -420,13 +441,14 @@ func DumpFile(f io.ReaderAt) {
 	fmt.Printf("[%08x] cbits=%d\n", r.Tell()-8, cbits)
 
 	abits := r.ReadBits(8)
-	fmt.Printf("[%08x] abits=%d\n", r.Tell()-8, cbits)
+	fmt.Printf("[%08x] abits=%d\n", r.Tell()-8, abits)
 
 	wordCount := readUnsigned(&r)
 	fmt.Printf("[%08x] WordCount=%v\n", r.Tell()-int64(unsignedLength(wordCount)*8), wordCount)
 
 	nodeCount := readUnsigned(&r)
 	fmt.Printf("[%08x] NodeCount=%v\n", r.Tell()-int64(unsignedLength(nodeCount)*8), nodeCount)
+
 	wbits := bits.Len(uint(wordCount))
 
 	edgeCount := readUnsigned(&r)
@@ -441,13 +463,14 @@ func DumpFile(f io.ReaderAt) {
 
 		if fallthr == 1 {
 			ch := r.ReadBits(int64(cbits))
-			fmt.Printf("[%08x] Node final=%d ch='%c' (fallthrough)\n", at, final, rune(ch))
+			fmt.Printf("[%08x] Node final=%d ch='%c' (fallthrough)\n", at, final, ch)
 			continue
 		}
 
 		singleEdge := r.ReadBits(1)
 		edges := uint64(1)
 		nskip := uint64(0)
+
 		if singleEdge != 1 {
 			edges = readUnsigned(&r)
 			nskip = r.ReadBits(int64(nskiplen))
@@ -466,9 +489,8 @@ func DumpFile(f io.ReaderAt) {
 			}
 			address := r.ReadBits(int64(abits))
 			fmt.Printf("[%08x] '%c' goto <%08x> skipping %d\n",
-				at, rune(ch), address, count)
+				at, ch, address, count)
 		}
-
 	}
 }
 
@@ -519,16 +541,15 @@ func unsignedLength(n uint64) uint64 {
 	return 0
 }
 
-/** @param cmp returns target - i  or cmp(i, target)*/
+/** @param cmp returns target - i or cmp(i, target)*/
 func bsearch(count int, cmp func(i int) int) int {
 	high := count
 	low := -1
+
 	var match, probe int
 	for high-low > 1 {
 		probe = (high + low) >> 1
-
 		match = cmp(probe)
-
 		if match == 0 {
 			return probe
 		} else if match < 0 {
@@ -537,6 +558,5 @@ func bsearch(count int, cmp func(i int) int) int {
 			high = probe
 		}
 	}
-
 	return high
 }

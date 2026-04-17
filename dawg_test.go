@@ -6,9 +6,10 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
-	"github.com/smhanov/dawg"
+	"github.com/dnstapir/dnsdawg"
 )
 
 func testsWords() []string {
@@ -35,12 +36,11 @@ func testDawg(t *testing.T, dawg dawg.Finder, words []string) {
 
 	for i, word := range words {
 		index := dawg.IndexOf(word)
+		// fmt.Printf("HULA: %d %d %s\n", i, index, word)
 
-		if index != i {
-			log.Panicf("Index returned should be %v, not %v", i, index)
-		}
+		wordFound, _ := dawg.AtIndex(index)
+		// fmt.Printf("HULA: %s\n", wordFound)
 
-		wordFound, _ := dawg.AtIndex(i)
 		if wordFound != word {
 			log.Panicf("AtIndex(%d) should be %s, not %s", i, word, wordFound)
 		}
@@ -49,7 +49,7 @@ func testDawg(t *testing.T, dawg dawg.Finder, words []string) {
 
 func runTest(t *testing.T, words []string) dawg.Finder {
 	finder := createDawg(words)
-	//finder.Print()
+	// finder.Print()
 	testDawg(t, finder, words)
 
 	// Now try the disk version
@@ -58,9 +58,9 @@ func runTest(t *testing.T, words []string) dawg.Finder {
 		log.Panic(err)
 	}
 
-	//f, err := os.Open("test.dawg")
-	//dawg.DumpFile(f)
-	//f.Close()
+	// f, err := os.Open("test.dawg")
+	// dawg.DumpFile(f)
+	// f.Close()
 
 	saved, err := dawg.Load("test.dawg")
 	if err != nil {
@@ -134,6 +134,100 @@ func TestPrefixes(t *testing.T) {
 	})
 }
 
+func testDNS(t *testing.T, words []string, word string, shouldbe []dawg.DNSResult) {
+	finder := createDawg(words)
+
+	results := finder.FindDNS(word)
+
+	if len(results) != len(shouldbe) {
+		t.Errorf("Got %v but should be %v", results, shouldbe)
+	}
+
+	for i, result := range results {
+		if result.Code != shouldbe[i].Code {
+			t.Errorf("Got %v but should be %v", results, shouldbe)
+			break
+		}
+        for j, label := range result.Labels {
+            if label != shouldbe[i].Labels[j] {
+                t.Errorf("Got %v but should be %v", results, shouldbe)
+                break
+            }
+        }
+	}
+}
+
+func TestDNS(t *testing.T) {
+	words := []string{
+		"",
+		"com.google.www",
+		"nu.hula",
+		"se.mcf.www",
+		"se.pp,1",
+        "top.ten,2main",
+        "zz.top,2domain,3tree",
+	}
+
+	testDNS(t, words, "nu.hula", []dawg.DNSResult{
+		{
+            Labels: []string{ "nu", "hula"}, 
+            Code: 0,
+        },
+    })
+
+	testDNS(t, words, "se.pp.hula.www", []dawg.DNSResult{
+		{
+            Labels: []string{ "se", "pp"}, 
+            Code: 1,
+        },
+	})
+
+	testDNS(t, words, "top.ten.main", []dawg.DNSResult{
+		{
+            Labels: []string{ "top", "ten"}, 
+            Code: 2,
+        },
+		{
+            Labels: []string{ "top", "ten", "main"}, 
+            Code: 0,
+        },
+	})
+
+	testDNS(t, words, "zz.top.domain.tree", []dawg.DNSResult{
+		{
+            Labels: []string{ "zz", "top"}, 
+            Code: 2,
+        },
+		{
+            Labels: []string{ "zz", "top", "domain"}, 
+            Code: 3,
+        },
+		{
+            Labels: []string{ "zz", "top", "domain", "tree"}, 
+            Code: 0,
+        },
+    })
+
+	testDNS(t, words, "zz.top.domain.tree.www", []dawg.DNSResult{
+		{
+            Labels: []string{ "zz", "top"}, 
+            Code: 2,
+        },
+		{
+            Labels: []string{ "zz", "top", "domain"}, 
+            Code: 3,
+        },
+    })
+
+	testDNS(t, words, "zz.top.main.tree", []dawg.DNSResult{
+		{
+            Labels: []string{ "zz", "top"}, 
+            Code: 2,
+        },
+    })
+}
+
+
 func readDictWords(t *testing.T) []string {
 	dict := "/usr/share/dict/words"
 	if _, err := os.Stat(dict); os.IsNotExist(err) {
@@ -150,7 +244,7 @@ func readDictWords(t *testing.T) []string {
 	var words []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		words = append(words, scanner.Text())
+		words = append(words, strings.ToLower(scanner.Text()))
 	}
 
 	sort.Slice(words, func(i, j int) bool {
@@ -185,12 +279,12 @@ func TestEnumerate(t *testing.T) {
 	}
 
 	finder := createDawg(words)
-	finder.Print()
+	// finder.Print()
 
 	total := 0
 	// test: when we get to catn, avoid descending
 	// when we get to cats, stop altogether.
-	finder.Enumerate(func(index int, word []rune, final bool) int {
+	finder.Enumerate(func(index int, word []byte, final bool) int {
 		if final {
 			total += 1
 		}
